@@ -48,11 +48,11 @@ def train_model(model, epochs, opt, loss, batch_size):
 
     # create dataset
     data_train = create_dataset(
-        datadir='path/to/training/data/',
+        datadir='./images/train',
         balance='upsample', mult=1)
 
     data_val = create_dataset(
-        datadir='path/to/validation/data/',
+        datadir='./images/validation',
         # path to val data
         balance='upsample', mult=1)
 
