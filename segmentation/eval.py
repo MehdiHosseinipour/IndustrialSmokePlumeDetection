@@ -31,6 +31,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 from sklearn.metrics import accuracy_score
+from torch.utils.data import DataLoader
 
 from model_unet import *
 from data import create_dataset
