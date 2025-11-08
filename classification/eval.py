@@ -41,14 +41,13 @@ torch.manual_seed(100)
 
 # load data
 batch_size = 10 # 1 to create diagnostic images, any value otherwise
-testdata = create_dataset(datadir='/home/mommermi/hsg/data/smoke_emission'
-                                  '/2020Neurips_dataset/classification/test')#path/to/test/data')
+testdata = create_dataset(datadir='./test')#path/to/test/data')
 all_dl = DataLoader(testdata, batch_size=batch_size, shuffle=True)
 progress = tqdm(enumerate(all_dl), total=len(all_dl))
 
 # load model
 model.load_state_dict(torch.load(
-    'classification.model', map_location=torch.device('cpu')))
+    'ep100_lr3e-01_bs30_mo0.7_002.model', map_location=torch.device('cpu')))
 model.eval()
 
 
