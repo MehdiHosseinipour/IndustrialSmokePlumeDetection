@@ -39,8 +39,8 @@ np.random.seed(3)
 torch.manual_seed(3)
 
 # load data
-valdata = create_dataset(datadir='/path/to/image/data',
-                         seglabeldir='/path/to/test/segmentation/labels/')
+valdata = create_dataset(datadir='./test',
+                         seglabeldir='./segmentation_labels')
 
 batch_size = 1 # 1 to create diagnostic images, any value otherwise
 all_dl = DataLoader(valdata, batch_size=batch_size, shuffle=True)
