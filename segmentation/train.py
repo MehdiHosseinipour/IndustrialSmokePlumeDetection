@@ -51,11 +51,11 @@ def train_model(model, epochs, opt, loss, batch_size):
 
     # create dataset
     data_train = create_dataset(
-        datadir='/path/to/image/data/',
-        seglabeldir='/path/to/segmentation/labels/for/training/', mult=1)
+        datadir='./train',
+        seglabeldir='./segmentation_labels', mult=1)
     data_val = create_dataset(
-        datadir='/path/to/image/data/',
-        seglabeldir='/path/to/segmentation/labels/for/validation/', mult=1)
+        datadir='./val',
+        seglabeldir='./segmentation_labels', mult=1)
 
     # draw random subsamples
     train_sampler = RandomSampler(data_train, replacement=True,
