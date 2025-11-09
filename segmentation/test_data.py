@@ -1,45 +1,109 @@
+# Copyright (C) 2020 Michael Mommert
+# This file is part of IndustrialSmokePlumeDetection
+# <https://github.com/HSG-AIML/IndustrialSmokePlumeDetection>.
+#
+# IndustrialSmokePlumeDetection is free software: you can redistribute it
+# and/or modify it under the terms of the GNU General Public License as
+# published by the Free Software Foundation, either version 3 of the License,
+# or (at your option) any later version.
+#
+# IndustrialSmokePlumeDetection is distributed in the hope that it will be
+# useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with IndustrialSmokePlumeDetection.  If not,
+# see <http://www.gnu.org/licenses/>.
+#
+# If you use this code for your own project, please cite the following
+# conference contribution:
+#   Mommert, M., Sigel, M., Neuhausler, M., Scheibenreif, L., Borth, D.,
+#   "Characterization of Industrial Smoke Plumes from Remote Sensing Data",
+#   Tackling Climate Change with Machine Learning workshop at NeurIPS 2020.
+#
+#
+# This file contains the data handling infrastructure for the segmentation
+# model.
+
 import os
 import numpy as np
+import json
 from matplotlib import pyplot as plt
 import rasterio as rio
+from rasterio.features import rasterize
+from shapely.geometry import Polygon
 import torch
 from torchvision import transforms
 
+# set random seeds
 torch.manual_seed(3)
 np.random.seed(3)
+
+# data directory
+outdir = os.path.abspath('.')
 
 class SmokePlumeSegmentationDataset():
     """SmokePlumeSegmentation dataset class."""
 
-    def __init__(self, datadir=None, transform=None):
-        """SmokePlumeSegmentation Dataset class."""
+    def __init__(self,
+                 datadir=None, seglabeldir=None, mult=1,
+                 transform=None):
+        """SmokePlumeSegmentation Dataset class.
+
+        The data set built will contain as many negative examples as there are
+        positive examples to enfore balancing.
+
+        The function `create_dataset` can be used as a wrapper to create a
+        data set.
+
+        :param datadir: (str) image directory root, required
+        :param seglabeldir: (str) segmentation label directory root, required
+        :param mult: (int) factor by which to multiply data set size, default=1
+        :param transform: (`torchvision.transform` object) transformations to be
+                          applied, default: `None`
+        """
+        
         self.datadir = datadir
         self.transform = transform
 
-        # list of image files
+        # list of image files, labels (positive or negative), segmentation
+        # label vector edge coordinates
         self.imgfiles = []
 
-        # read in image file names
+        self.indices = []
         idx = 0
         for root, dirs, files in os.walk(datadir):
             for filename in files:
                 if not filename.endswith('.tif'):
                     continue
+                self.indices.append(idx)
                 self.imgfiles.append(os.path.join(root, filename))
                 idx += 1
 
-        # convert list into array
+        
+
+        # turn lists into arrays
         self.imgfiles = np.array(self.imgfiles)
+        np.array([*self.indices])
+        # increase data set size by factor `mult`
+            
 
     def __len__(self):
         """Returns length of data set."""
         return len(self.imgfiles)
 
+
     def __getitem__(self, idx):
-        """Read in image data and apply transformations."""
+        """Read in image data, preprocess, build segmentation mask, and apply
+        transformations."""
+
+        # read in image data
         imgfile = rio.open(self.imgfiles[idx])
         imgdata = np.array([imgfile.read(i) for i in
                             [1,2,3,4,5,6,7,8,9,10,12,13]])
+        # skip band 11 (Sentinel-2 Band 10, Cirrus) as it does not contain
+        # useful information in the case of Level-2A data products
 
         # force image shape to be 120 x 120 pixels
         if imgdata.shape[1] != 120:
@@ -57,6 +121,7 @@ class SmokePlumeSegmentationDataset():
                                                   :, imgdata.shape[2]-1:]
             imgdata = newimgdata
 
+        # rasterize segmentation polygons
         sample = {'idx': idx,
                   'img': imgdata,
                   'imgfile': self.imgfiles[idx]}
@@ -68,21 +133,30 @@ class SmokePlumeSegmentationDataset():
         return sample
 
 
-def create_dataset(*args, apply_transforms=True, **kwargs):
-    """Create a dataset."""
-    if apply_transforms:
-        data_transforms = transforms.Compose([
-            Normalize(),
-            Randomize(),
-            RandomCrop(),
-            ToTensor()
-        ])
-    else:
-        data_transforms = None
+    def display(self, idx):
+        """Helper method to display a given example from the data set with
+        index `idx`. Only RGB channels are displayed, as well as the
+        segmentation label outlines.
 
-    data = SmokePlumeSegmentationDataset(*args, **kwargs, transform=data_transforms)
-    return data
+        :param idx: (int) image index to be displayed
+        :param offset: (float) constant scaling offset (on a range [0,1])
+        :param scaling: (float) scaling factor
+        :return: `matplotlib.pyplot.figure` object
+        """
+        sample = self[idx]
+        imgdata = sample['img']
 
+        # scale image data
+        imgdata = offset+scaling*(
+            np.dstack([imgdata[3], imgdata[2], imgdata[1]])-
+            np.min([imgdata[3], imgdata[2], imgdata[1]]))/ \
+                (np.max([imgdata[3], imgdata[2], imgdata[1]])-
+                 np.min([imgdata[3], imgdata[2], imgdata[1]]))
+
+        f, ax = plt.subplots(1, 2, figsize=(6, 3))
+        ax[0].imshow(imgdata)
+
+        return f  
 
 class ToTensor(object):
     """Convert ndarrays in sample to Tensors."""
@@ -91,17 +165,20 @@ class ToTensor(object):
         :param sample: sample to be converted to Tensor
         :return: converted Tensor sample
         """
+
         out = {'idx': sample['idx'],
                'img': torch.from_numpy(sample['img'].copy()),
                'imgfile': sample['imgfile']}
 
         return out
 
-
 class Normalize(object):
     """Normalize pixel values to zero mean and range [-1, +1] measured in
     standard deviations."""
     def __init__(self):
+        """
+        :param size: edge length of quadratic output size
+        """
         self.channel_means = np.array(
             [809.2, 900.5, 1061.4, 1091.7, 1384.5, 1917.8,
              2105.2, 2186.3, 2224.8, 2346.8, 1901.2, 1460.42])
@@ -114,12 +191,12 @@ class Normalize(object):
         :param sample: sample to be normalized
         :return: normalized sample
         """
-        sample['img'] = (sample['img'] - self.channel_means.reshape(
-            sample['img'].shape[0], 1, 1)) / self.channel_stds.reshape(
+
+        sample['img'] = (sample['img']-self.channel_means.reshape(
+            sample['img'].shape[0], 1, 1))/self.channel_stds.reshape(
             sample['img'].shape[0], 1, 1)
 
         return sample
-
 
 class Randomize(object):
     """Randomize image orientation including rotations by integer multiples of
@@ -142,12 +219,11 @@ class Randomize(object):
             imgdata = np.flip(imgdata, 1)
         # rotate by [0,1,2,3]*90 deg
         rot = np.random.randint(0, 4)
-        imgdata = np.rot90(imgdata, rot, axes=(1, 2))
+        imgdata = np.rot90(imgdata, rot, axes=(1,2))
 
         return {'idx': sample['idx'],
                 'img': imgdata.copy(),
                 'imgfile': sample['imgfile']}
-
 
 class RandomCrop(object):
     """Randomly crop 90x90 pixel image (from 120x120)."""
@@ -159,28 +235,28 @@ class RandomCrop(object):
         """
         imgdata = sample['img']
 
-        x, y = np.random.randint(0, 30, 2)
+        x = np.random.randint(0, 30, 2)
 
         return {'idx': sample['idx'],
                 'img': imgdata.copy()[:, y:y+90, x:x+90],
                 'imgfile': sample['imgfile']}
 
 
-def display(self, idx):
-    """Helper method to display a given example from the data set with
-    index `idx`. Only RGB channels are displayed.
+def create_dataset(*args, apply_transforms=True, **kwargs):
+    """Create a dataset; uses same input parameters as PowerPlantDataset.
+    :param apply_transforms: if `True`, apply available transformations
+    :return: data set"""
+    if apply_transforms:
+        data_transforms = transforms.Compose([
+            Normalize(),
+            Randomize(),
+            RandomCrop(),
+            ToTensor()
+           ])
+    else:
+        data_transforms = None
 
-    :param idx: (int) image index to be displayed
-    """
-    sample = self[idx]
-    imgdata = sample['img']
+    data = SmokePlumeSegmentationDataset(*args, **kwargs,
+                                         transform=data_transforms)
 
-    # scale image data
-    imgdata = (imgdata - np.min(imgdata)) / (np.max(imgdata) - np.min(imgdata))
-
-    f, ax = plt.subplots(1, 1, figsize=(6, 3))
-    ax.imshow(imgdata.transpose(1, 2, 0))
-    ax.set_xticks([])
-    ax.set_yticks([])
-
-    return f
+    return data
