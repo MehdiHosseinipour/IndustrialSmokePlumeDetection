@@ -76,6 +76,9 @@ for i, batch in progress:
 
     # obtain binary prediction map
     pred = np.zeros(output.shape)
+    output=output.cpu()
+    y=y.cpu()
+    x=x.cpu()
     pred[output >= 0] = 1
 
     # derive Iou score
@@ -178,10 +181,10 @@ for i, batch in progress:
         ax3.annotate("IoU={:.2f}".format(this_iou), xy=(5,15), fontsize=8)
 
         f.subplots_adjust(0.05, 0.02, 0.95, 0.9, 0.05, 0.05)
+        f.tight_layout() 
 
         plt.savefig(res+(os.path.split(batch['imgfile'][0])[1]).\
-                    replace('.tif', '_eval.png').replace(':', '_'),
-                    tight_layout=True, dpi=200)
+                    replace('.tif', '_eval.png').replace(':', '_'), dpi=200)
         plt.close()
 
 print('iou:', len(all_ious), np.average(all_ious))
