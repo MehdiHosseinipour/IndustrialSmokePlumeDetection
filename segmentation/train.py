@@ -49,6 +49,10 @@ def train_model(model, epochs, opt, loss, batch_size):
     :param loss: loss function instance
     :param batch_size: (int) batch size"""
 
+    # Initialize tracking variables for best model
+    best_val_loss = float('inf')  # Initialize best validation loss
+    best_model_wts = None  # To store the weights of the best model
+
     # create dataset
     data_train = create_dataset(
         datadir='./train',
@@ -219,7 +223,12 @@ def train_model(model, epochs, opt, loss, batch_size):
                    epoch+1, train_loss_total/(i+1), val_loss_total/(j+1),
                    np.average(train_ious), np.average(val_ious),
                    train_acc_total/(i+1), val_acc_total/(j+1)))
-      
+
+        # Check if the current model is the best model
+        if val_loss_total/(j+1) < best_val_loss:
+            best_val_loss = val_loss_total/(j+1)
+            best_model_wts = model.state_dict()  # Save the best model's weights
+
         # save model checkpoint
         if epoch % 1 == 0:
             torch.save(model.state_dict(),
@@ -229,6 +238,10 @@ def train_model(model, epochs, opt, loss, batch_size):
         writer.flush()
         scheduler.step(val_loss_total/(j+1))
         torch.cuda.empty_cache()
+
+    # Save the best model after training
+    if best_model_wts is not None:
+        torch.save(best_model_wts, 'segmentation.model')
 
     return model
 
@@ -264,4 +277,3 @@ scheduler = optim.lr_scheduler.ReduceLROnPlateau(opt, 'min',
 train_model(model, args.ep, opt, loss, args.bs)
 
 writer.close()
-
