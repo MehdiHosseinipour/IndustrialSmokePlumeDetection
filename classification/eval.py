@@ -47,7 +47,7 @@ progress = tqdm(enumerate(all_dl), total=len(all_dl))
 
 # load model
 model.load_state_dict(torch.load(
-    'classification_model.model', map_location=torch.device('cpu')))
+    'classification.model', map_location=torch.device('cpu')))
 model.eval()
 
 
