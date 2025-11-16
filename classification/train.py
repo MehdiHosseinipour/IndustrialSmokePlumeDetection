@@ -148,7 +148,7 @@ def train_model(model, epochs, opt, loss, batch_size):
         # Save the model if the validation accuracy improves
         if val_acc_total/(j+1) > best_val_acc:
             best_val_acc = val_acc_total/(j+1)
-            torch.save(model.state_dict(), 'classification_model.pth')
+            torch.save(model.state_dict(), 'classification.model')
 
         writer.flush()
         scheduler.step(epoch)
