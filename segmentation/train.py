@@ -248,7 +248,7 @@ def train_model(model, epochs, opt, loss, batch_size):
 
 # setup argument parser
 parser = argparse.ArgumentParser()
-parser.add_argument('-ep', type=int, default=300,
+parser.add_argument('-ep', type=int, default=100,
                     help='Number of epochs')
 parser.add_argument('-bs', type=int, nargs='?',
                     default=60, help='Batch size')
