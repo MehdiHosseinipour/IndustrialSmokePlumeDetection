@@ -37,6 +37,7 @@ import argparse
 from model import *
 from data import create_dataset
 
+
 def train_model(model, epochs, opt, loss, batch_size):
     """Wrapper function for model training.
 
@@ -67,6 +68,8 @@ def train_model(model, epochs, opt, loss, batch_size):
                           pin_memory=True, sampler=train_sampler)
     val_dl = DataLoader(data_val, batch_size=batch_size, num_workers=4,
                          pin_memory=True, sampler=val_sampler)
+
+    best_val_acc = 0  # Track the best validation accuracy
 
     # start training process
     for epoch in range(epochs):
@@ -141,19 +144,17 @@ def train_model(model, epochs, opt, loss, batch_size):
                "train acc={:.3f}, val acc={:.3f}").format(
                    epoch+1, train_loss_total/(i+1), val_loss_total/(j+1),
                    train_acc_total/(i+1), val_acc_total/(j+1)))
-      
-        # # save model checkpoint
-        # if epoch % 1 == 0:
-        #     torch.save(model.state_dict(),
-        #     'ep{:0d}_lr{:.0e}_bs{:02d}_mo{:.1f}_{:03d}.model'.format(
-        #         args.ep, args.lr, args.bs, args.mo, epoch))
+
+        # Save the model if the validation accuracy improves
+        if val_acc_total/(j+1) > best_val_acc:
+            best_val_acc = val_acc_total/(j+1)
+            torch.save(model.state_dict(), 'classification_model.pth')
 
         writer.flush()
         scheduler.step(epoch)
         torch.cuda.empty_cache()
 
     return model
-
 
 # setup argument parser
 parser = argparse.ArgumentParser()
