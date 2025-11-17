@@ -19,6 +19,9 @@ from test_data import create_dataset
 np.random.seed(3)
 torch.manual_seed(3)
 
+# Set font to Times New Roman globally
+plt.rcParams['font.family'] = 'serif'
+
 # load data
 valdata = create_dataset(datadir='./test2', apply_transforms=False)
 
@@ -30,8 +33,9 @@ progress = tqdm(enumerate(all_dl), total=len(all_dl))
 model.load_state_dict(torch.load('segmentation.model', map_location=torch.device('cpu')))
 model.eval()
 
-# To store area in square meters over time
-smoke_areas_m2 = []
+# To store area in square kilometers over time and the corresponding dates
+smoke_areas_km2 = []
+image_dates = []
 
 for i, batch in progress:
     x = batch['img'].float().to(device)
@@ -55,8 +59,21 @@ for i, batch in progress:
     # Convert to square meters (1 pixel = 10m * 10m = 100m²)
     area_pred_m2 = area_pred_pixels * 100  # 100 square meters per pixel
     
-    smoke_areas_m2.append(area_pred_m2[0])  # Append area for each image in square meters
+    # Convert to square kilometers (1 km² = 1,000,000 m²)
+    area_pred_km2 = area_pred_m2 / 1000000  # Convert to square kilometers
     
+    smoke_areas_km2.append(area_pred_km2[0])  # Append area for each image in square kilometers
+    
+    # Extract the date from the image filename (assuming the format 's2_patch_YYYYMMDD_scaled_120x120.tif')
+    image_filename = batch['imgfile'][0]
+    
+    # Extract the date part (YYYYMMDD) from the filename
+    date_str = os.path.splitext(os.path.basename(image_filename))[0].split('_')[2]  # Extract date (YYYYMMDD)
+    
+    # Format the date as 'YYYY-MM-DD'
+    formatted_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+    image_dates.append(formatted_date)  # Append the formatted date to the list
+
     # For diagnostics (optional)
     if batch_size == 1:
         f, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(1, 3))
@@ -75,7 +92,7 @@ for i, batch in progress:
         ax1.set_xticks([])
         ax1.set_yticks([])
 
-        # false color plot
+        # False color plot
         ax2.imshow(0.2 + (np.dstack([x[0][0], x[0][9], x[0][10]]) - np.min([x[0][0].numpy(),
                                                                               x[0][9].numpy(),
                                                                               x[0][10].numpy()])) /
@@ -88,7 +105,7 @@ for i, batch in progress:
         ax2.set_xticks([])
         ax2.set_yticks([])
 
-        # segmentation ground-truth and prediction
+        # Segmentation ground-truth and prediction
         ax3.imshow(pred[0][0], cmap='Greens', alpha=0.3)
         ax3.set_xticks([])
         ax3.set_yticks([])
@@ -98,14 +115,22 @@ for i, batch in progress:
         plt.savefig((os.path.split(batch['imgfile'][0])[1]).replace('.tif', '_eval.png').replace(':', '_'), dpi=200)
         plt.close()
 
-# Create and save the time series graph in square meters
-time_points = np.arange(len(smoke_areas_m2))  # Assuming images are processed in order over time
+# Sort the areas by date
+sorted_data = sorted(zip(image_dates, smoke_areas_km2), key=lambda x: x[0])
+
+# Unzip the sorted data back into sorted lists
+sorted_dates, sorted_areas = zip(*sorted_data)
+
+# Create and save the time series graph in square kilometers
 plt.figure(figsize=(10, 6))
-plt.plot(time_points, smoke_areas_m2, marker='o', color='b', linestyle='-', label="Smoke Area (m²)")
-plt.xlabel("Time (Image Index)", fontsize=12)
-plt.ylabel("Smoke Area (m²)", fontsize=12)
-plt.title("Smoke Area Over Time (in Square Meters)", fontsize=14)
+plt.plot(sorted_dates, sorted_areas, marker='o', color='b', linestyle='-', label="Smoke Area (km²)")
+plt.xlabel("Date", fontsize=12)
+plt.ylabel("Smoke Area (km²)", fontsize=12)
 plt.grid(True)
+plt.xticks(rotation=45)  # Rotate x-axis labels for better readability
 plt.legend(loc='best')
-plt.savefig("smoke_area_over_time_m2.png", dpi=300)
+plt.tight_layout()  # Ensure tight layout for the plot
+
+# Save the plot as a PNG image
+plt.savefig("smoke_area_over_time_km2_sorted.png", dpi=600)
 plt.show()
