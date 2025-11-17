@@ -49,7 +49,7 @@ np.random.seed(3)
 torch.manual_seed(3)
 
 # load data
-valdata = create_dataset(datadir='./test2',apply_transforms=False
+valdata = create_dataset(datadir='./test',apply_transforms=False
                          )
 
 batch_size = 1 # 1 to create diagnostic images, any value otherwise
