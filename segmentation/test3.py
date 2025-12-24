@@ -1,19 +1,12 @@
 import os
+import re
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
-from sklearn.metrics import accuracy_score
 from torch.utils.data import DataLoader
-import torch
-from torch import nn, optim
 from tqdm.autonotebook import tqdm
-from sklearn.metrics import accuracy_score
-from torch.utils.data import DataLoader, random_split, RandomSampler
-from torch.utils.tensorboard import SummaryWriter
-import argparse
-from sklearn.metrics import jaccard_score
 import pandas as pd
-from datetime import datetime  # Import datetime module
+from datetime import datetime
 from scipy.ndimage import label
 
 from model_unet import *
@@ -21,139 +14,159 @@ from test_data import create_dataset
 
 np.random.seed(3)
 torch.manual_seed(3)
-
-# Set font to Times New Roman globally
 plt.rcParams['font.family'] = 'serif'
+
+# -------------------------
+# CONFIG
+# -------------------------
+PATCH_SIZE_M = 1200            # meters (matches your GEE patch size)
+AREA_MAX_KM2 = 0.72            # ONLY keep/save samples with area < 0.72 km²
+OUT_IMG_DIR = "filtered_images"
+OUT_EXCEL = "smoke_area_filtered_lt_0p72km2.xlsx"
+OUT_PLOT = "smoke_area_filtered_lt_0p72km2.png"
+# -------------------------
+
+def parse_date_from_filename(path):
+    base = os.path.basename(path)
+    m = re.search(r'(\d{8})', base)  # YYYYMMDD
+    if not m:
+        return None
+    return datetime.strptime(m.group(1), "%Y%m%d").date()
+
+def area_km2_from_mask(binary_mask_2d, patch_size_m):
+    h, w = binary_mask_2d.shape
+    pixel_area_m2 = (patch_size_m / w) * (patch_size_m / h)
+    return float(binary_mask_2d.sum()) * pixel_area_m2 / 1e6
 
 # load data
 valdata = create_dataset(datadir='./test2', apply_transforms=False)
-
-batch_size = 1  # 1 to create diagnostic images, any value otherwise
-all_dl = DataLoader(valdata, batch_size=batch_size, shuffle=True)
+all_dl = DataLoader(valdata, batch_size=1, shuffle=False)
 progress = tqdm(enumerate(all_dl), total=len(all_dl))
 
 # load model
 model.load_state_dict(torch.load('segmentation.model', map_location=torch.device('cpu')))
 model.eval()
 
-# To store area in square kilometers over time and the corresponding dates
-smoke_areas_km2 = []
-image_dates = []
+# results (only for area < 0.72)
+kept_dates = []
+kept_areas = []
+kept_files = []
 
-# Loop to process each batch
+os.makedirs(OUT_IMG_DIR, exist_ok=True)
+
 for i, batch in progress:
     x = batch['img'].float().to(device)
-    idx = batch['idx']
+    imgfile = batch['imgfile'][0]
 
-    output = model(x)
-    output = output.cpu()
-    x = x.cpu()
-    
-    # Obtain binary prediction map
-    pred = np.zeros(output.shape)
-    pred[output >= 0] = 1
-    
-    # Derive binary segmentation map from prediction
-    output_binary = np.zeros(output.shape)
-    output_binary[output.cpu().detach().numpy() >= 0] = 1
+    # ---- DATE ----
+    img_date = parse_date_from_filename(imgfile)
+    if img_date is None:
+        print(f"Warning: No YYYYMMDD found in filename: {imgfile}. Skipping.")
+        continue
 
-    # Identify connected components (smoke patches)
-    output_binary_numpy = output_binary[0][0].astype(np.uint8)  # Convert tensor to NumPy array
-    labeled_array, num_features = label(output_binary_numpy)  # Label connected components
-    
-    # Get the coordinates of the central region (9 central pixels in a 3x3 block)
-    height, width = output_binary[0][0].shape
-    center_x, center_y = width // 2, height // 2  # Coordinates of the central pixel
-    central_region = output_binary[0][0][center_y-1:center_y+2, center_x-1:center_x+2]  # 3x3 region
-    
-    # Check if any of the connected components (smoke patches) intersect with the central region
+    # ---- MODEL OUTPUT ----
+    output = model(x).detach().cpu().numpy()      # [B,1,H,W] logits
+    x_cpu = x.detach().cpu()
+
+    # ---- BINARY MAP (logits threshold) ----
+    output_binary_2d = (output[0, 0] > 0).astype(np.uint8)
+
+    # ---- CONNECTED COMPONENTS ----
+    labeled_array, num_features = label(output_binary_2d)
+
+    h, w = output_binary_2d.shape
+    cx, cy = w // 2, h // 2
+    y0, y1 = max(cy - 1, 0), min(cy + 2, h)
+    x0, x1 = max(cx - 1, 0), min(cx + 2, w)
+
     central_patch = None
-    for label_num in range(1, num_features + 1):  # Label starts at 1
-        # Create a mask for each connected component
+    for label_num in range(1, num_features + 1):
         component_mask = (labeled_array == label_num)
-        
-        # Check if the component intersects with the central region
-        if np.any(component_mask[center_y-1:center_y+2, center_x-1:center_x+2]):  # Check overlap with 3x3 region
+        if np.any(component_mask[y0:y1, x0:x1]):
             central_patch = label_num
-            break  # Keep the first patch found in the center region
+            break
 
-    # If a central patch exists, keep it
     if central_patch is not None:
-        # Keep only the pixels corresponding to the central patch
-        output_binary[0][0] = (labeled_array == central_patch)
+        central_smoke_area = (labeled_array == central_patch).astype(np.uint8)
+    else:
+        central_smoke_area = np.zeros_like(output_binary_2d, dtype=np.uint8)
 
-        # Visualize only the central patch (mask the rest of the image)
-        central_smoke_area = np.zeros_like(output_binary[0][0])  # Create an empty image
-        central_smoke_area[output_binary[0][0] == 1] = 1  # Set the central patch to 1
+    # ---- AREA ----
+    area_km2 = area_km2_from_mask(central_smoke_area, PATCH_SIZE_M)
 
-        # Plot the result showing only the central smoke area
-        f, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(1, 3))
+    # ---- KEEP ONLY area < 0.72 km² ----
+    if area_km2 >= AREA_MAX_KM2:
+        continue
 
-        # RGB plot
-        ax1.imshow(0.2 + 1.5 * (np.dstack([x[0][3], x[0][2], x[0][1]]) - np.min([x[0][3].numpy(),
-                                                                                       x[0][2].numpy(),
-                                                                                       x[0][1].numpy()])) / 
-                   (np.max([x[0][3].numpy(),
-                            x[0][2].numpy(),
-                            x[0][1].numpy()]) - np.min([x[0][3].numpy(),
-                                                       x[0][2].numpy(),
-                                                       x[0][1].numpy()])),
-                   origin='upper')
-        ax1.set_title('RGB', fontsize=8)
-        ax1.set_xticks([])
-        ax1.set_yticks([])
+    # store results
+    kept_dates.append(img_date)
+    kept_areas.append(area_km2)
+    kept_files.append(os.path.basename(imgfile))
 
-        # False color plot
-        ax2.imshow(0.2 + (np.dstack([x[0][0], x[0][9], x[0][10]]) - np.min([x[0][0].numpy(),
-                                                                              x[0][9].numpy(),
-                                                                              x[0][10].numpy()])) / 
-                   (np.max([x[0][0].numpy(),
-                            x[0][9].numpy(),
-                            x[0][10].numpy()]) - np.min([x[0][0].numpy(),
-                                                       x[0][9].numpy(),
-                                                       x[0][10].numpy()])),
-                   origin='upper')
-        ax2.set_xticks([])
-        ax2.set_yticks([])
+    # ---- SAVE DIAGNOSTIC IMAGE (ONLY for kept samples) ----
+    f, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(1, 3))
 
-        # Segmentation ground-truth and central patch only
-        ax3.imshow(central_smoke_area, cmap='Greens', alpha=0.5)  # Show only the central patch
-        ax3.set_xticks([])
-        ax3.set_yticks([])
+    # RGB (B4,B3,B2) -> indices depend on your dataset order
+    ax1.imshow(
+        0.2 + 1.5 * (np.dstack([x_cpu[0][3], x_cpu[0][2], x_cpu[0][1]]) - np.min([x_cpu[0][3].numpy(),
+                                                                                  x_cpu[0][2].numpy(),
+                                                                                  x_cpu[0][1].numpy()])) /
+        (np.max([x_cpu[0][3].numpy(),
+                 x_cpu[0][2].numpy(),
+                 x_cpu[0][1].numpy()]) - np.min([x_cpu[0][3].numpy(),
+                                                 x_cpu[0][2].numpy(),
+                                                 x_cpu[0][1].numpy()])),
+        origin='upper'
+    )
+    ax1.set_title('RGB', fontsize=8)
+    ax1.set_xticks([]); ax1.set_yticks([])
 
-        f.subplots_adjust(0.05, 0.02, 0.95, 0.9, 0.05, 0.05)
-        f.tight_layout()
-        plt.savefig((os.path.split(batch['imgfile'][0])[1]).replace('.tif', '_central_eval.png').replace(':', '_'), dpi=200)
-        plt.close()
+    # False color (your previous indices)
+    ax2.imshow(
+        0.2 + (np.dstack([x_cpu[0][0], x_cpu[0][9], x_cpu[0][10]]) - np.min([x_cpu[0][0].numpy(),
+                                                                            x_cpu[0][9].numpy(),
+                                                                            x_cpu[0][10].numpy()])) /
+        (np.max([x_cpu[0][0].numpy(),
+                 x_cpu[0][9].numpy(),
+                 x_cpu[0][10].numpy()]) - np.min([x_cpu[0][0].numpy(),
+                                                  x_cpu[0][9].numpy(),
+                                                  x_cpu[0][10].numpy()])),
+        origin='upper'
+    )
+    ax2.set_xticks([]); ax2.set_yticks([])
 
-# Continue with sorting and saving data to Excel
-# Sort the areas by date
-sorted_data = sorted(zip(image_dates, smoke_areas_km2), key=lambda x: x[0])
+    ax3.imshow(central_smoke_area, cmap='Greens', alpha=0.7)
+    ax3.set_title(f"Central patch | {area_km2:.4f} km²", fontsize=8)
+    ax3.set_xticks([]); ax3.set_yticks([])
 
-# Unzip the sorted data back into sorted lists
-sorted_dates, sorted_areas = zip(*sorted_data)
+    f.tight_layout()
 
-# Create and save the time series graph in square kilometers
+    out_png = os.path.basename(imgfile).replace('.tif', f'_central_lt_{AREA_MAX_KM2}km2.png').replace(':', '_')
+    out_png_path = os.path.join(OUT_IMG_DIR, out_png)
+    plt.savefig(out_png_path, dpi=200)
+    plt.close()
+
+# ---- EXPORT FILTERED RESULTS TO EXCEL + PLOT ----
+if len(kept_dates) == 0:
+    raise ValueError(f"No samples found with area < {AREA_MAX_KM2} km². Nothing to export.")
+
+df = pd.DataFrame({
+    'Date': kept_dates,
+    'Smoke Area (km²)': kept_areas,
+    'Filename': kept_files
+}).sort_values('Date').reset_index(drop=True)
+
+df.to_excel(OUT_EXCEL, index=False)
+print(f"Excel saved: {OUT_EXCEL}")
+print(f"Saved diagnostic images to folder: {OUT_IMG_DIR}")
+
 plt.figure(figsize=(10, 6))
-plt.plot(sorted_dates, sorted_areas, marker='o', color='b', linestyle='-', label="Smoke Area (km²)")
+plt.plot(df['Date'], df['Smoke Area (km²)'], marker='o', linestyle='-')
 plt.xlabel("Date", fontsize=12)
 plt.ylabel("Smoke Area (km²)", fontsize=12)
 plt.grid(True)
-plt.xticks(rotation=45)  # Rotate x-axis labels for better readability
-plt.legend(loc='best')
-plt.tight_layout()  # Ensure tight layout for the plot
-
-# Save the plot as a PNG image
-plt.savefig("smoke_area_over_time_km2_sorted.png", dpi=600)
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.savefig(OUT_PLOT, dpi=600)
 plt.show()
-
-# Save the sorted data to an Excel file
-df = pd.DataFrame({
-    'Date': sorted_dates,
-    'Smoke Area (km²)': sorted_areas
-})
-
-# Save to Excel file with datetime formatted Date column
-df.to_excel("smoke_area_over_time_sorted.xlsx", index=False)
-
-print("Excel file saved as 'smoke_area_over_time_sorted.xlsx'")
+print(f"Plot saved: {OUT_PLOT}")
