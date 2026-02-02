@@ -50,7 +50,7 @@ progress = tqdm(enumerate(all_dl), total=len(all_dl))
 # LOAD MODEL
 # -------------------------
 model.load_state_dict(
-    torch.load('segmentation.model', map_location=torch.device('cpu'))
+    torch.load('segmentation_best.model', map_location=torch.device('cpu'))
 )
 model.eval()
 
