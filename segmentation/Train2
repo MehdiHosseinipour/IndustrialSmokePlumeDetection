@@ -1,0 +1,218 @@
+# Copyright (C) 2020 Michael Mommert
+# This file is part of IndustrialSmokePlumeDetection
+# <https://github.com/HSG-AIML/IndustrialSmokePlumeDetection>.
+
+import numpy as np
+import torch
+from torch import nn, optim
+from tqdm.autonotebook import tqdm
+from sklearn.metrics import accuracy_score, jaccard_score
+from torch.utils.data import DataLoader, RandomSampler
+from torch.utils.tensorboard import SummaryWriter
+import argparse
+
+from model_unet import *
+from data import create_dataset
+
+print('running on...', device)
+
+
+def train_model(model, epochs, opt, loss, batch_size):
+
+    # ===================== BEST MODEL TRACKING =====================
+    best_val_loss = float('inf')
+    best_model_wts = None
+    best_epoch_stats = {}
+
+    # ===================== DATA =====================
+    data_train = create_dataset(
+        datadir='./train',
+        seglabeldir='./segmentation_labels', mult=1)
+    data_val = create_dataset(
+        datadir='./val',
+        seglabeldir='./segmentation_labels', mult=1)
+
+    train_sampler = RandomSampler(
+        data_train, replacement=True,
+        num_samples=int(2 * len(data_train) / 3))
+    val_sampler = RandomSampler(
+        data_val, replacement=True,
+        num_samples=int(2 * len(data_val) / 3))
+
+    train_dl = DataLoader(
+        data_train, batch_size=batch_size,
+        num_workers=6, pin_memory=True,
+        sampler=train_sampler)
+    val_dl = DataLoader(
+        data_val, batch_size=batch_size,
+        num_workers=6, pin_memory=True,
+        sampler=val_sampler)
+
+    # ===================== TRAINING LOOP =====================
+    for epoch in range(epochs):
+
+        # ===================== TRAIN =====================
+        model.train()
+        train_loss_total = 0
+        train_ious = []
+        train_acc_total = 0
+        train_arearatios = []
+
+        for i, batch in enumerate(train_dl):
+            x = batch['img'].float().to(device)
+            y = batch['fpt'].float().to(device)
+
+            output = model(x)
+
+            output_binary = np.zeros(output.shape)
+            output_binary[output.detach().cpu().numpy() >= 0] = 1
+
+            for j in range(y.shape[0]):
+                if (np.sum(output_binary[j][0]) != 0 and
+                        np.sum(y[j].cpu().numpy()) != 0):
+                    train_ious.append(
+                        jaccard_score(
+                            y[j].flatten().cpu().numpy(),
+                            output_binary[j][0].flatten()
+                        )
+                    )
+
+            y_bin = (np.sum(y.cpu().numpy(), axis=(1, 2)) != 0).astype(int)
+            pred_bin = (np.sum(output_binary, axis=(1, 2, 3)) != 0).astype(int)
+            train_acc_total += accuracy_score(y_bin, pred_bin)
+
+            loss_epoch = loss(output, y.unsqueeze(1))
+            train_loss_total += loss_epoch.item()
+
+            opt.zero_grad()
+            loss_epoch.backward()
+            opt.step()
+
+        train_loss = train_loss_total / (i + 1)
+        train_iou = np.mean(train_ious)
+        train_acc = train_acc_total / (i + 1)
+
+        writer.add_scalar("training loss", train_loss, epoch)
+        writer.add_scalar("training iou", train_iou, epoch)
+        writer.add_scalar("training acc", train_acc, epoch)
+
+        torch.cuda.empty_cache()
+
+        # ===================== VALIDATION =====================
+        model.eval()
+        val_loss_total = 0
+        val_ious = []
+        val_acc_total = 0
+
+        TP = TN = FP = FN = 0
+
+        with torch.no_grad():
+            for j, batch in enumerate(val_dl):
+                x = batch['img'].float().to(device)
+                y = batch['fpt'].float().to(device)
+
+                output = model(x)
+                output_binary = np.zeros(output.shape)
+                output_binary[output.cpu().numpy() >= 0] = 1
+
+                loss_epoch = loss(output, y.unsqueeze(1))
+                val_loss_total += loss_epoch.item()
+
+                for k in range(y.shape[0]):
+                    if (np.sum(output_binary[k][0]) != 0 and
+                            np.sum(y[k].cpu().numpy()) != 0):
+                        val_ious.append(
+                            jaccard_score(
+                                y[k].flatten().cpu().numpy(),
+                                output_binary[k][0].flatten()
+                            )
+                        )
+
+                y_bin = (np.sum(y.cpu().numpy(), axis=(1, 2)) != 0).astype(int)
+                pred_bin = (np.sum(output_binary, axis=(1, 2, 3)) != 0).astype(int)
+
+                val_acc_total += accuracy_score(y_bin, pred_bin)
+
+                for gt, pr in zip(y_bin, pred_bin):
+                    if gt == 1 and pr == 1:
+                        TP += 1
+                    elif gt == 0 and pr == 0:
+                        TN += 1
+                    elif gt == 0 and pr == 1:
+                        FP += 1
+                    elif gt == 1 and pr == 0:
+                        FN += 1
+
+        val_loss = val_loss_total / (j + 1)
+        val_iou = np.mean(val_ious)
+        val_acc = val_acc_total / (j + 1)
+
+        writer.add_scalar("val loss", val_loss, epoch)
+        writer.add_scalar("val iou", val_iou, epoch)
+        writer.add_scalar("val acc", val_acc, epoch)
+
+        scheduler.step(val_loss)
+
+        # ===================== BEST MODEL =====================
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_model_wts = model.state_dict()
+
+            best_epoch_stats = {
+                "epoch": epoch + 1,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "train_iou": train_iou,
+                "val_iou": val_iou,
+                "train_acc": train_acc,
+                "val_acc": val_acc,
+                "TP": TP,
+                "TN": TN,
+                "FP": FP,
+                "FN": FN
+            }
+
+        writer.flush()
+        torch.cuda.empty_cache()
+
+    # ===================== SAVE & FINAL PRINT =====================
+    torch.save(best_model_wts, "segmentation_best.model")
+
+    print("\n===== BEST MODEL RESULTS =====")
+    print((
+        "Epoch {epoch}: "
+        "train loss={train_loss:.3f}, val loss={val_loss:.3f}, "
+        "train iou={train_iou:.3f}, val iou={val_iou:.3f}, "
+        "train acc={train_acc:.3f}, val acc={val_acc:.3f}"
+    ).format(**best_epoch_stats))
+
+    print(
+        "TP={TP}, TN={TN}, FP={FP}, FN={FN}".format(**best_epoch_stats)
+    )
+
+    return model
+
+
+# ===================== ARGUMENTS =====================
+parser = argparse.ArgumentParser()
+parser.add_argument('-ep', type=int, default=100)
+parser.add_argument('-bs', type=int, default=60)
+parser.add_argument('-lr', type=float, default=0.7)
+parser.add_argument('-mo', type=float, default=0.7)
+args = parser.parse_args()
+
+# ===================== TENSORBOARD =====================
+writer = SummaryWriter(
+    'runs/' + "ep{:0d}_lr{:.0e}_bs{:03d}_mo{:.1f}/".format(
+        args.ep, args.lr, args.bs, args.mo)
+)
+
+# ===================== MODEL SETUP =====================
+loss = nn.BCEWithLogitsLoss()
+opt = optim.SGD(model.parameters(), lr=args.lr, momentum=args.mo)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    opt, 'min', factor=0.5, threshold=1e-4, min_lr=1e-6)
+
+# ===================== RUN =====================
+train_model(model, args.ep, opt, loss, args.bs)
+writer.close()
