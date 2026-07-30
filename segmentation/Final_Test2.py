@@ -82,7 +82,10 @@ for i, batch in progress:
 
     # ---- BINARY MAP ----
     output_binary_2d = (output[0, 0] > 0).astype(np.uint8)
-    
+
+    # ---- IMAGE SIZE ----
+    h, w = output_binary_2d.shape
+
     # ---- USE FULL SMOKE MASK (NO CONNECTED COMPONENT FILTER) ----
     smoke_area_mask = output_binary_2d.copy()
 
@@ -103,7 +106,7 @@ for i, batch in progress:
     f, (ax1, ax3) = plt.subplots(2, 1, figsize=(6, 6))
 
     # ---- RGB IMAGE ----
-    ax1.imshow(
+    rgb_image = (
         0.2 + 1.5 * (
             np.dstack([x_cpu[0][3], x_cpu[0][2], x_cpu[0][1]]) -
             np.min([x_cpu[0][3].numpy(),
@@ -116,9 +119,14 @@ for i, batch in progress:
             np.min([x_cpu[0][3].numpy(),
                     x_cpu[0][2].numpy(),
                     x_cpu[0][1].numpy()])
-        ),
+        )
+    )
+    rgb_image = np.clip(rgb_image, 0, 1)
+    ax1.imshow(
+        rgb_image,
         origin='upper'
     )
+
     ax1.set_title('RGB', fontsize=8)
     ax1.set_xticks([]); ax1.set_yticks([])
 
