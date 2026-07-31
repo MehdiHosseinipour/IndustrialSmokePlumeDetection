@@ -1,218 +1,1075 @@
+# ==========================================================
 # Copyright (C) 2020 Michael Mommert
-# This file is part of IndustrialSmokePlumeDetection
-# <https://github.com/HSG-AIML/IndustrialSmokePlumeDetection>.
+# IndustrialSmokePlumeDetection
+#
+# Modified:
+# - Epoch = 300
+# - Batch size = 16
+# - Learning rate = 0.01
+# - Momentum = 0.9
+# - SGD Optimizer
+# - BCE + Dice Loss
+# - Threshold = 0.5
+# - Early stopping
+# - Best model based on Validation IoU
+# ==========================================================
+
 
 import numpy as np
 import torch
+
 from torch import nn, optim
-from tqdm.autonotebook import tqdm
-from sklearn.metrics import accuracy_score, jaccard_score
 from torch.utils.data import DataLoader, RandomSampler
 from torch.utils.tensorboard import SummaryWriter
+
+from tqdm.autonotebook import tqdm
+
+from sklearn.metrics import accuracy_score
+from sklearn.metrics import jaccard_score
+
+from copy import deepcopy
 import argparse
+
 
 from model_unet import *
 from data import create_dataset
 
-print('running on...', device)
+
+print("Running on:", device)
 
 
-def train_model(model, epochs, opt, loss, batch_size):
 
-    # ===================== BEST MODEL TRACKING =====================
-    best_val_loss = float('inf')
+# ==========================================================
+# Dice Loss
+# ==========================================================
+
+class DiceLoss(nn.Module):
+
+    def __init__(self, smooth=1e-6):
+
+        super(DiceLoss, self).__init__()
+
+        self.smooth = smooth
+
+
+
+    def forward(self, inputs, targets):
+
+        # Convert logits to probabilities
+        inputs = torch.sigmoid(inputs)
+
+
+        inputs = inputs.contiguous()
+        targets = targets.contiguous()
+
+
+        intersection = (
+            inputs * targets
+        ).sum(dim=(2,3))
+
+
+        dice = (
+            2. * intersection + self.smooth
+        ) / (
+            inputs.sum(dim=(2,3))
+            +
+            targets.sum(dim=(2,3))
+            +
+            self.smooth
+        )
+
+
+        return 1 - dice.mean()
+
+
+
+# ==========================================================
+# Combined BCE + Dice Loss
+# ==========================================================
+
+bce_loss = nn.BCEWithLogitsLoss()
+
+dice_loss = DiceLoss()
+
+
+
+def combined_loss(pred, target):
+
+    bce = bce_loss(
+        pred,
+        target
+    )
+
+
+    dice = dice_loss(
+        pred,
+        target
+    )
+
+
+    return bce + dice
+
+
+
+# ==========================================================
+# IoU Calculation Function
+# ==========================================================
+
+def calculate_iou(y_true, y_pred):
+
+    ious = []
+
+
+    for i in range(len(y_true)):
+
+        true = y_true[i].flatten()
+
+        pred = y_pred[i].flatten()
+
+
+        # Ignore empty images
+
+        if (
+            np.sum(true) != 0
+            and
+            np.sum(pred) != 0
+        ):
+
+            iou = jaccard_score(
+                true,
+                pred
+            )
+
+            ious.append(iou)
+
+
+
+    if len(ious) == 0:
+
+        return 0
+
+
+    return np.mean(ious)
+
+
+
+
+# ==========================================================
+# Training Function
+# ==========================================================
+
+def train_model(
+        model,
+        epochs,
+        opt,
+        loss,
+        batch_size):
+
+
+
+    # ------------------------------------------------------
+    # Best model tracking
+    # ------------------------------------------------------
+
+    best_val_iou = 0.0
+
     best_model_wts = None
-    best_epoch_stats = {}
 
-    # ===================== DATA =====================
+
+
+    # ------------------------------------------------------
+    # Early stopping
+    # ------------------------------------------------------
+
+    patience = 30
+
+    counter = 0
+
+
+
+    # ------------------------------------------------------
+    # Dataset
+    # ------------------------------------------------------
+
     data_train = create_dataset(
+
         datadir='./train',
-        seglabeldir='./segmentation_labels', mult=1)
+
+        seglabeldir='./segmentation_labels',
+
+        mult=1
+    )
+
+
+
     data_val = create_dataset(
+
         datadir='./val',
-        seglabeldir='./segmentation_labels', mult=1)
+
+        seglabeldir='./segmentation_labels',
+
+        mult=1
+    )
+
+
+
+    # ------------------------------------------------------
+    # Sampling
+    # ------------------------------------------------------
 
     train_sampler = RandomSampler(
-        data_train, replacement=True,
-        num_samples=int(2 * len(data_train) / 3))
+
+        data_train,
+
+        replacement=True,
+
+        num_samples=int(
+            2 * len(data_train) / 3
+        )
+    )
+
+
+
     val_sampler = RandomSampler(
-        data_val, replacement=True,
-        num_samples=int(2 * len(data_val) / 3))
+
+        data_val,
+
+        replacement=True,
+
+        num_samples=int(
+            2 * len(data_val) / 3
+        )
+    )
+
+
+
+    # ------------------------------------------------------
+    # DataLoader
+    # ------------------------------------------------------
 
     train_dl = DataLoader(
-        data_train, batch_size=batch_size,
-        num_workers=6, pin_memory=True,
-        sampler=train_sampler)
-    val_dl = DataLoader(
-        data_val, batch_size=batch_size,
-        num_workers=6, pin_memory=True,
-        sampler=val_sampler)
 
-    # ===================== TRAINING LOOP =====================
+        data_train,
+
+        batch_size=batch_size,
+
+        num_workers=6,
+
+        pin_memory=True,
+
+        sampler=train_sampler
+    )
+
+
+
+    val_dl = DataLoader(
+
+        data_val,
+
+        batch_size=batch_size,
+
+        num_workers=6,
+
+        pin_memory=True,
+
+        sampler=val_sampler
+    )
+
+
+
+
+    # ======================================================
+    # Epoch Loop
+    # ======================================================
+
+
     for epoch in range(epochs):
 
-        # ===================== TRAIN =====================
-        model.train()
-        train_loss_total = 0
-        train_ious = []
-        train_acc_total = 0
-        train_arearatios = []
 
-        for i, batch in enumerate(train_dl):
+        print(
+            f"\nEpoch {epoch+1}/{epochs}"
+        )
+
+
+        # ==================================================
+        # Training
+        # ==================================================
+
+        model.train()
+
+
+
+        train_loss_total = 0
+
+        train_acc_total = 0
+
+        train_preds = []
+
+        train_targets = []
+
+
+
+        progress = tqdm(
+
+            enumerate(train_dl),
+
+            total=len(train_dl),
+
+            desc="Training"
+        )
+
+
+
+        for i, batch in progress:
+
+
             x = batch['img'].float().to(device)
+
             y = batch['fpt'].float().to(device)
+
+
+
+            # Forward
 
             output = model(x)
 
-            output_binary = np.zeros(output.shape)
-            output_binary[output.detach().cpu().numpy() >= 0] = 1
 
-            for j in range(y.shape[0]):
-                if (np.sum(output_binary[j][0]) != 0 and
-                        np.sum(y[j].cpu().numpy()) != 0):
-                    train_ious.append(
-                        jaccard_score(
-                            y[j].flatten().cpu().numpy(),
-                            output_binary[j][0].flatten()
-                        )
-                    )
 
-            y_bin = (np.sum(y.cpu().numpy(), axis=(1, 2)) != 0).astype(int)
-            pred_bin = (np.sum(output_binary, axis=(1, 2, 3)) != 0).astype(int)
-            train_acc_total += accuracy_score(y_bin, pred_bin)
+            # ------------------------------
+            # Threshold = 0.5
+            # ------------------------------
 
-            loss_epoch = loss(output, y.unsqueeze(1))
+            output_prob = torch.sigmoid(output)
+
+
+
+            output_binary = (
+
+                output_prob
+
+                .detach()
+
+                .cpu()
+
+                .numpy()
+
+                >=0.5
+
+            ).astype(int)
+
+
+
+            y_numpy = (
+
+                y.detach()
+
+                .cpu()
+
+                .numpy()
+
+            )
+
+
+
+            train_preds.extend(
+                output_binary[:,0]
+            )
+
+
+            train_targets.extend(
+                y_numpy
+            )
+
+
+
+            # Image level accuracy
+
+            y_bin = np.array(
+
+                np.sum(y_numpy,axis=(1,2))
+
+                !=0
+
+            ).astype(int)
+
+
+
+            pred_bin = np.array(
+
+                np.sum(
+                    output_binary,
+                    axis=(1,2,3)
+                )
+
+                !=0
+
+            ).astype(int)
+
+
+
+            train_acc_total += accuracy_score(
+
+                y_bin,
+
+                pred_bin
+
+            )
+
+
+
+            # Loss
+
+            loss_epoch = loss(
+
+                output,
+
+                y.unsqueeze(dim=1)
+
+            )
+
+
             train_loss_total += loss_epoch.item()
 
+
+
+            # Backpropagation
+
             opt.zero_grad()
+
+
             loss_epoch.backward()
+
+
             opt.step()
 
-        train_loss = train_loss_total / (i + 1)
-        train_iou = np.mean(train_ious)
-        train_acc = train_acc_total / (i + 1)
 
-        writer.add_scalar("training loss", train_loss, epoch)
-        writer.add_scalar("training iou", train_iou, epoch)
-        writer.add_scalar("training acc", train_acc, epoch)
+
+            progress.set_description(
+
+                "Train Loss %.4f"
+
+                %
+                (
+                    train_loss_total/(i+1)
+                )
+            )
+        # ==================================================
+        # End of Training Epoch
+        # ==================================================
+
+        train_iou = calculate_iou(
+            train_targets,
+            train_preds
+        )
+
+
+        train_loss = (
+            train_loss_total /
+            (i + 1)
+        )
+
+
+        train_acc = (
+            train_acc_total /
+            (i + 1)
+        )
+
+
+
+        # TensorBoard logging
+
+        writer.add_scalar(
+            "training loss",
+            train_loss,
+            epoch
+        )
+
+
+        writer.add_scalar(
+            "training IoU",
+            train_iou,
+            epoch
+        )
+
+
+        writer.add_scalar(
+            "training accuracy",
+            train_acc,
+            epoch
+        )
+
+
 
         torch.cuda.empty_cache()
 
-        # ===================== VALIDATION =====================
+
+
+        # ==================================================
+        # Validation
+        # ==================================================
+
         model.eval()
+
+
         val_loss_total = 0
-        val_ious = []
+
         val_acc_total = 0
 
-        TP = TN = FP = FN = 0
+
+        val_preds = []
+
+        val_targets = []
+
+
 
         with torch.no_grad():
-            for j, batch in enumerate(val_dl):
+
+
+            progress = tqdm(
+
+                enumerate(val_dl),
+
+                total=len(val_dl),
+
+                desc="Validation"
+
+            )
+
+
+
+            for j, batch in progress:
+
+
                 x = batch['img'].float().to(device)
+
+
                 y = batch['fpt'].float().to(device)
 
-                output = model(x)
-                output_binary = np.zeros(output.shape)
-                output_binary[output.cpu().numpy() >= 0] = 1
 
-                loss_epoch = loss(output, y.unsqueeze(1))
+
+                # Forward
+
+                output = model(x)
+
+
+
+                # Loss
+
+                loss_epoch = loss(
+
+                    output,
+
+                    y.unsqueeze(dim=1)
+
+                )
+
+
                 val_loss_total += loss_epoch.item()
 
-                for k in range(y.shape[0]):
-                    if (np.sum(output_binary[k][0]) != 0 and
-                            np.sum(y[k].cpu().numpy()) != 0):
-                        val_ious.append(
-                            jaccard_score(
-                                y[k].flatten().cpu().numpy(),
-                                output_binary[k][0].flatten()
-                            )
-                        )
 
-                y_bin = (np.sum(y.cpu().numpy(), axis=(1, 2)) != 0).astype(int)
-                pred_bin = (np.sum(output_binary, axis=(1, 2, 3)) != 0).astype(int)
 
-                val_acc_total += accuracy_score(y_bin, pred_bin)
+                # ------------------------------
+                # Threshold = 0.5
+                # ------------------------------
 
-                for gt, pr in zip(y_bin, pred_bin):
-                    if gt == 1 and pr == 1:
-                        TP += 1
-                    elif gt == 0 and pr == 0:
-                        TN += 1
-                    elif gt == 0 and pr == 1:
-                        FP += 1
-                    elif gt == 1 and pr == 0:
-                        FN += 1
+                output_prob = torch.sigmoid(output)
 
-        val_loss = val_loss_total / (j + 1)
-        val_iou = np.mean(val_ious)
-        val_acc = val_acc_total / (j + 1)
 
-        writer.add_scalar("val loss", val_loss, epoch)
-        writer.add_scalar("val iou", val_iou, epoch)
-        writer.add_scalar("val acc", val_acc, epoch)
 
-        scheduler.step(val_loss)
+                output_binary = (
 
-        # ===================== BEST MODEL =====================
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_model_wts = model.state_dict()
+                    output_prob
 
-            best_epoch_stats = {
-                "epoch": epoch + 1,
-                "train_loss": train_loss,
-                "val_loss": val_loss,
-                "train_iou": train_iou,
-                "val_iou": val_iou,
-                "train_acc": train_acc,
-                "val_acc": val_acc,
-                "TP": TP,
-                "TN": TN,
-                "FP": FP,
-                "FN": FN
-            }
+                    .cpu()
 
-        writer.flush()
+                    .numpy()
+
+                    >=0.5
+
+                ).astype(int)
+
+
+
+                y_numpy = (
+
+                    y.cpu()
+
+                    .numpy()
+
+                )
+
+
+
+                val_preds.extend(
+
+                    output_binary[:,0]
+
+                )
+
+
+                val_targets.extend(
+
+                    y_numpy
+
+                )
+
+
+
+                # Image classification accuracy
+
+                y_bin = np.array(
+
+                    np.sum(
+                        y_numpy,
+                        axis=(1,2)
+                    )
+
+                    !=0
+
+                ).astype(int)
+
+
+
+                pred_bin = np.array(
+
+                    np.sum(
+                        output_binary,
+                        axis=(1,2,3)
+                    )
+
+                    !=0
+
+                ).astype(int)
+
+
+
+                val_acc_total += accuracy_score(
+
+                    y_bin,
+
+                    pred_bin
+
+                )
+
+
+
+                progress.set_description(
+
+                    "Val Loss %.4f"
+
+                    %
+                    (
+                        val_loss_total/(j+1)
+                    )
+
+                )
+
+
+
+        # --------------------------------------------------
+        # Validation Metrics
+        # --------------------------------------------------
+
+
+        val_loss = (
+
+            val_loss_total /
+
+            (j + 1)
+
+        )
+
+
+        val_iou = calculate_iou(
+
+            val_targets,
+
+            val_preds
+
+        )
+
+
+        val_acc = (
+
+            val_acc_total /
+
+            (j + 1)
+
+        )
+
+
+
+        # TensorBoard
+
+        writer.add_scalar(
+
+            "validation loss",
+
+            val_loss,
+
+            epoch
+
+        )
+
+
+        writer.add_scalar(
+
+            "validation IoU",
+
+            val_iou,
+
+            epoch
+
+        )
+
+
+        writer.add_scalar(
+
+            "validation accuracy",
+
+            val_acc,
+
+            epoch
+
+        )
+
+
+
+        # --------------------------------------------------
+        # Print Epoch Results
+        # --------------------------------------------------
+
+        print(
+
+            "\nEpoch {:03d}: "
+
+            "Train Loss={:.4f} | "
+
+            "Val Loss={:.4f} | "
+
+            "Train IoU={:.4f} | "
+
+            "Val IoU={:.4f} | "
+
+            "Train Acc={:.4f} | "
+
+            "Val Acc={:.4f}"
+
+            .format(
+
+                epoch + 1,
+
+                train_loss,
+
+                val_loss,
+
+                train_iou,
+
+                val_iou,
+
+                train_acc,
+
+                val_acc
+
+            )
+
+        )
+
+
+
+        # ==================================================
+        # Save Best Model Based on Validation IoU
+        # ==================================================
+
+
+        if val_iou > best_val_iou:
+
+
+            print(
+
+                "✓ Validation IoU improved - Saving model"
+
+            )
+
+
+            best_val_iou = val_iou
+
+
+
+            # Important:
+            # deepcopy prevents weight overwrite
+
+            best_model_wts = deepcopy(
+
+                model.state_dict()
+
+            )
+
+
+            counter = 0
+
+
+
+        else:
+
+
+            counter += 1
+
+
+            print(
+
+                f"No improvement "
+                f"{counter}/{patience}"
+
+            )
+
+
+
+        # ==================================================
+        # Save Epoch Checkpoint
+        # ==================================================
+
+
+        torch.save(
+
+            model.state_dict(),
+
+            'ep{:03d}_lr{:.3f}_bs{:02d}.model'
+
+            .format(
+
+                epoch + 1,
+
+                args.lr,
+
+                args.bs
+
+            )
+
+        )
+
+
+
+        # ==================================================
+        # Learning Rate Scheduler
+        # ==================================================
+
+        scheduler.step(
+
+            val_loss
+
+        )
+
+
+
         torch.cuda.empty_cache()
 
-    # ===================== SAVE & FINAL PRINT =====================
-    torch.save(best_model_wts, "segmentation_best.model")
 
-    print("\n===== BEST MODEL RESULTS =====")
-    print((
-        "Epoch {epoch}: "
-        "train loss={train_loss:.3f}, val loss={val_loss:.3f}, "
-        "train iou={train_iou:.3f}, val iou={val_iou:.3f}, "
-        "train acc={train_acc:.3f}, val acc={val_acc:.3f}"
-    ).format(**best_epoch_stats))
 
-    print(
-        "TP={TP}, TN={TN}, FP={FP}, FN={FN}".format(**best_epoch_stats)
-    )
+        # ==================================================
+        # Early Stopping
+        # ==================================================
+
+        if counter >= patience:
+
+
+            print(
+
+                "\nEarly stopping activated!"
+
+            )
+
+
+            print(
+
+                "Best Validation IoU:",
+
+                best_val_iou
+
+            )
+
+
+            break
+
+
+
+    # ======================================================
+    # Save Final Best Model
+    # ======================================================
+
+
+    if best_model_wts is not None:
+
+
+        torch.save(
+
+            best_model_wts,
+
+            'segmentation_best.model'
+
+        )
+
+
+        print(
+
+            "\nBest model saved:"
+            " segmentation_best.model"
+
+        )
+
+
 
     return model
+# ==========================================================
+# Argument Parser
+# ==========================================================
 
 
-# ===================== ARGUMENTS =====================
 parser = argparse.ArgumentParser()
-parser.add_argument('-ep', type=int, default=100)
-parser.add_argument('-bs', type=int, default=60)
-parser.add_argument('-lr', type=float, default=0.7)
-parser.add_argument('-mo', type=float, default=0.7)
-args = parser.parse_args()
 
-# ===================== TENSORBOARD =====================
-writer = SummaryWriter(
-    'runs/' + "ep{:0d}_lr{:.0e}_bs{:03d}_mo{:.1f}/".format(
-        args.ep, args.lr, args.bs, args.mo)
+
+
+parser.add_argument(
+    '-ep',
+    type=int,
+    default=300,
+    help='Number of epochs'
 )
 
-# ===================== MODEL SETUP =====================
-loss = nn.BCEWithLogitsLoss()
-opt = optim.SGD(model.parameters(), lr=args.lr, momentum=args.mo)
-scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-    opt, 'min', factor=0.5, threshold=1e-4, min_lr=1e-6)
 
-# ===================== RUN =====================
-train_model(model, args.ep, opt, loss, args.bs)
+
+parser.add_argument(
+    '-bs',
+    type=int,
+    nargs='?',
+    default=16,
+    help='Batch size'
+)
+
+
+
+parser.add_argument(
+    '-lr',
+    type=float,
+    nargs='?',
+    default=0.01,
+    help='Learning rate'
+)
+
+
+
+parser.add_argument(
+    '-mo',
+    type=float,
+    nargs='?',
+    default=0.9,
+    help='Momentum'
+)
+
+
+
+args = parser.parse_args()
+
+
+
+# ==========================================================
+# TensorBoard Writer
+# ==========================================================
+
+
+writer = SummaryWriter(
+
+    'runs/'
+    +
+    "ep{:03d}_lr{:.3f}_bs{:02d}_mo{:.1f}"
+
+    .format(
+
+        args.ep,
+
+        args.lr,
+
+        args.bs,
+
+        args.mo
+
+    )
+
+)
+
+
+
+# ==========================================================
+# Loss Function
+# ==========================================================
+
+
+loss = combined_loss
+
+
+
+# ==========================================================
+# Optimizer
+# SGD
+# ==========================================================
+
+
+opt = optim.SGD(
+
+    model.parameters(),
+
+    lr=args.lr,
+
+    momentum=args.mo
+
+)
+
+
+
+# ==========================================================
+# Learning Rate Scheduler
+# ==========================================================
+
+
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+
+    opt,
+
+    mode='min',
+
+    factor=0.5,
+
+    threshold=1e-4,
+
+    patience=10,
+
+    min_lr=1e-6
+
+)
+
+
+
+# ==========================================================
+# Start Training
+# ==========================================================
+
+
+train_model(
+
+    model,
+
+    args.ep,
+
+    opt,
+
+    loss,
+
+    args.bs
+
+)
+
+
+
+# Close TensorBoard
+
 writer.close()
